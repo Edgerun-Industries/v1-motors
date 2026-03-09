@@ -1,0 +1,13 @@
+# Target labels
+ bootloader
+# Source files and their labels
+/Users/davidvenegas/Code/v1-motors/build/CMakeFiles/bootloader
+/Users/davidvenegas/Code/v1-motors/build/CMakeFiles/bootloader.rule
+/Users/davidvenegas/Code/v1-motors/build/CMakeFiles/bootloader-complete.rule
+/Users/davidvenegas/Code/v1-motors/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+/Users/davidvenegas/Code/v1-motors/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+/Users/davidvenegas/Code/v1-motors/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+/Users/davidvenegas/Code/v1-motors/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+/Users/davidvenegas/Code/v1-motors/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+/Users/davidvenegas/Code/v1-motors/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+/Users/davidvenegas/Code/v1-motors/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule
