@@ -1,0 +1,12 @@
+# ESP-IDF build output
+build/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Local/backup config artifacts
+sdkconfig.old
+
+# macOS metadata
+.DS_Store
