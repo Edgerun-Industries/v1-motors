@@ -16,17 +16,17 @@ while [[ $# -gt 0 ]]; do
       ;;
     -h|--help)
       cat <<'EOF'
-Usage: ./run_motor_test.sh [options]
+Usage: ./run.sh [options]
 
 Options:
   -p, --port <port>   Serial port (default: /dev/cu.usbmodem101)
-  --flash-only        Only build/flash firmware, do not open terminal console
+  --flash-only        Only build/flash firmware, do not open GUI
   -h, --help          Show this help
 
 Examples:
-  ./run_motor_test.sh
-  ./run_motor_test.sh --port /dev/cu.usbmodem101
-  ./run_motor_test.sh --flash-only
+  ./run.sh
+  ./run.sh --port /dev/cu.usbmodem101
+  ./run.sh --flash-only
 EOF
       exit 0
       ;;
@@ -58,5 +58,5 @@ if [[ "${FLASH_ONLY}" -eq 1 ]]; then
   exit 0
 fi
 
-echo "Starting motor terminal console..."
-python3 "${SCRIPT_DIR}/motor_terminal.py" --port "${PORT}"
+echo "Starting GUI..."
+python3 "${SCRIPT_DIR}/motor_gui.py" --port "${PORT}"

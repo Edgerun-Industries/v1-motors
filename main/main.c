@@ -1,274 +1,279 @@
 /**
- * Minimal single-motor CubeMars MIT test (ESP32-S3 + CAN).
- * Goal: from terminal, send "spin_once cw|ccw" and get one controlled revolution.
+ * Single-motor exo controller with runtime mode switching.
+ *
+ * Modes:
+ * - transparent: very light friction/gravity compensation.
+ * - assist: human-torque observer with smooth current assist.
  */
 
 #include <math.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include "driver/twai.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #define CAN_TX_GPIO GPIO_NUM_4
 #define CAN_RX_GPIO GPIO_NUM_5
-#define MOTOR_ID 1
+#define MOTOR_ID 104
 
-#define CONTROL_PERIOD_MS 20
-#define SPIN_ONE_TURN_RAD 6.2831853f
+#define CONTROL_PERIOD_MS 10
+#define STATUS_PERIOD_MS 500
+#define BUS_STATUS_PERIOD_MS 5000
 
-#define P_MIN (-12.5f)
-#define P_MAX (12.5f)
-#define V_MIN (-37.5f)
-#define V_MAX (37.5f)
-#define T_MIN (-32.0f)
-#define T_MAX (32.0f)
-#define KP_MIN (0.0f)
-#define KP_MAX (500.0f)
-#define KD_MIN (0.0f)
-#define KD_MAX (5.0f)
+#define CAN_PACKET_SET_CURRENT 1
+#define ERPM_TO_RAD_S 0.104719755f
+#define DEG_TO_RAD 0.01745329252f
 
-static const char *TAG = "cubemars";
-static const uint8_t CMD_ENTER_MOTOR_MODE[8] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC };
-static const uint8_t CMD_EXIT_MOTOR_MODE[8] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD };
+// Observer / assist tuning.
+#define VEL_LP_ALPHA 0.35f
+#define ACC_LP_ALPHA 0.40f
+#define J_EQUIV 0.0035f
+#define B_EQUIV 0.0300f
+#define TAU_COULOMB 0.0700f
+#define K_TAU_PER_AMP 0.1000f
+#define HUMAN_TAU_DEADBAND 0.0350f
+#define ASSIST_GAIN 0.90f
+
+// Intent gating / drift rejection.
+#define INTENT_START_VEL_ERPM 30.0f
+#define INTENT_STOP_VEL_ERPM 12.0f
+#define INTENT_START_ACC_RAD_S2 9.0f
+#define BIAS_VEL_ERPM 8.0f
+#define BIAS_ACC_RAD_S2 2.0f
+#define BIAS_ALPHA 0.02f
+
+// Transparent mode compensation.
+#define TR_K_VEL 0.015f
+#define TR_K_COULOMB 0.040f
+#define TR_K_GRAV 0.030f
+#define TR_MAX_CURRENT_A 0.20f
+
+// Command shaping / limits.
+#define MAX_ASSIST_CURRENT_A 0.55f
+#define CMD_SLEW_UP_A_PER_STEP 0.020f
+#define CMD_SLEW_DOWN_A_PER_STEP 0.014f
+#define CMD_ZERO_CROSS_STEP 0.030f
+#define POS_LIMIT_DEG 90.0f
+
+typedef enum {
+    MODE_TRANSPARENT = 0,
+    MODE_ASSIST = 1,
+} control_mode_t;
 
 typedef struct {
     bool enabled;
-    bool spin_active;
-    float target_p;
-    int64_t spin_start_us;
-
-    float p_cmd;
-    float v_cmd;
-    float kp_cmd;
-    float kd_cmd;
-    float t_cmd;
+    control_mode_t mode;
 
     bool fb_seen;
-    float p_fb;
-    float v_fb;
-    float t_fb;
-    int temp_fb;
-    int err_fb;
+    float pos_deg;
+    float vel_erpm;
+    float cur_a;
+    int temp_c;
+    int err_code;
+
+    float vel_filt_erpm;
+    float acc_filt_rad_s2;
+    float human_tau_est_nm;
+    float tau_bias_nm;
+    float cmd_current_a;
+    bool intent_active;
+
+    bool zero_ref_set;
+    float zero_ref_deg;
 
     uint32_t tx_count;
     uint32_t rx_count;
     uint32_t rx_any_count;
-    uint32_t last_rx_can_id;
-    uint8_t last_rx_dlc;
-    bool last_rx_extd;
-} motor_state_t;
+} ctrl_state_t;
 
-static motor_state_t g_state = {
+static ctrl_state_t g = {
     .enabled = false,
-    .spin_active = false,
-    .p_cmd = 0.0f,
-    .v_cmd = 0.0f,
-    .kp_cmd = 0.0f,
-    .kd_cmd = 1.0f,
-    .t_cmd = 0.0f,
+    .mode = MODE_ASSIST,
 };
+static const char *TAG = "exo_ctrl";
 static portMUX_TYPE g_lock = portMUX_INITIALIZER_UNLOCKED;
-static int g_motor_id = MOTOR_ID;
-static bool g_log_raw = false;
 
-static float uint_to_float(int x_int, float x_min, float x_max, int bits)
+static float clampf(float x, float lo, float hi)
 {
-    return ((float)x_int) * (x_max - x_min) / ((float)((1 << bits) - 1)) + x_min;
+    if (x < lo) return lo;
+    if (x > hi) return hi;
+    return x;
 }
 
-static int float_to_uint(float x, float x_min, float x_max, int bits)
+static float signf0(float x)
 {
-    if (x < x_min) x = x_min;
-    if (x > x_max) x = x_max;
-    return (int)((x - x_min) * ((float)((1 << bits) - 1)) / (x_max - x_min));
+    if (x > 0.0f) return 1.0f;
+    if (x < 0.0f) return -1.0f;
+    return 0.0f;
 }
 
-static esp_err_t send_can_frame(const uint8_t data[8])
+static float slew_toward(float current, float target, float max_step)
 {
-    int motor_id;
-    portENTER_CRITICAL(&g_lock);
-    motor_id = g_motor_id;
-    portEXIT_CRITICAL(&g_lock);
+    float delta = target - current;
+    if (delta > max_step) return current + max_step;
+    if (delta < -max_step) return current - max_step;
+    return target;
+}
 
-    twai_message_t msg = {
-        .identifier = (uint32_t)motor_id,
-        .data_length_code = 8,
-        .flags = 0,
+static float smooth_command_update(float current, float target)
+{
+    if ((current > 0.0f && target < 0.0f) || (current < 0.0f && target > 0.0f)) {
+        if (fabsf(current) > CMD_ZERO_CROSS_STEP) {
+            return slew_toward(current, 0.0f, CMD_ZERO_CROSS_STEP);
+        }
+        return slew_toward(0.0f, target, CMD_SLEW_UP_A_PER_STEP);
+    }
+    if (fabsf(target) > fabsf(current)) {
+        return slew_toward(current, target, CMD_SLEW_UP_A_PER_STEP);
+    }
+    return slew_toward(current, target, CMD_SLEW_DOWN_A_PER_STEP);
+}
+
+static esp_err_t send_servo_current(uint8_t id, float current_a)
+{
+    int32_t cur_raw = (int32_t)(current_a * 1000.0f);
+    uint8_t payload[4] = {
+        (uint8_t)((cur_raw >> 24) & 0xFF),
+        (uint8_t)((cur_raw >> 16) & 0xFF),
+        (uint8_t)((cur_raw >> 8) & 0xFF),
+        (uint8_t)(cur_raw & 0xFF),
     };
-    memcpy(msg.data, data, 8);
-    return twai_transmit(&msg, pdMS_TO_TICKS(100));
-}
 
-static esp_err_t send_can_frame_ext(uint32_t can_id, const uint8_t *data, uint8_t dlc)
-{
     twai_message_t msg = {
-        .identifier = can_id,
-        .data_length_code = dlc,
+        .identifier = ((uint32_t)CAN_PACKET_SET_CURRENT << 8) | id,
+        .data_length_code = 4,
         .flags = TWAI_MSG_FLAG_EXTD,
     };
-    memset(msg.data, 0, sizeof(msg.data));
-    if (data != NULL && dlc > 0) {
-        memcpy(msg.data, data, dlc);
-    }
+    memcpy(msg.data, payload, 4);
     return twai_transmit(&msg, pdMS_TO_TICKS(100));
 }
 
-static void pack_mit_command(float p, float v, float kp, float kd, float t_ff, uint8_t out[8])
+static float compute_human_tau(ctrl_state_t *s, float *vfilt_out, float *afilt_out, float *tau_bias_out)
 {
-    const int p_int = float_to_uint(p, P_MIN, P_MAX, 16);
-    const int v_int = float_to_uint(v, V_MIN, V_MAX, 12);
-    const int kp_int = float_to_uint(kp, KP_MIN, KP_MAX, 12);
-    const int kd_int = float_to_uint(kd, KD_MIN, KD_MAX, 12);
-    const int t_int = float_to_uint(t_ff, T_MIN, T_MAX, 12);
+    float vfilt = s->vel_filt_erpm + VEL_LP_ALPHA * (s->vel_erpm - s->vel_filt_erpm);
+    float vel_rad_s = vfilt * ERPM_TO_RAD_S;
+    float prev_vel_rad_s = s->vel_filt_erpm * ERPM_TO_RAD_S;
+    float acc_raw = (vel_rad_s - prev_vel_rad_s) / (CONTROL_PERIOD_MS * 0.001f);
+    float afilt = s->acc_filt_rad_s2 + ACC_LP_ALPHA * (acc_raw - s->acc_filt_rad_s2);
+    float tau_motor = K_TAU_PER_AMP * s->cur_a;
+    float tau_raw = (J_EQUIV * afilt) + (B_EQUIV * vel_rad_s) + (TAU_COULOMB * signf0(vel_rad_s)) - tau_motor;
+    float tau_bias = s->tau_bias_nm;
 
-    out[0] = (uint8_t)(p_int >> 8);
-    out[1] = (uint8_t)(p_int & 0xFF);
-    out[2] = (uint8_t)(v_int >> 4);
-    out[3] = (uint8_t)(((v_int & 0x0F) << 4) | (kp_int >> 8));
-    out[4] = (uint8_t)(kp_int & 0xFF);
-    out[5] = (uint8_t)(kd_int >> 4);
-    out[6] = (uint8_t)(((kd_int & 0x0F) << 4) | (t_int >> 8));
-    out[7] = (uint8_t)(t_int & 0xFF);
+    if ((fabsf(vfilt) <= BIAS_VEL_ERPM) && (fabsf(afilt) <= BIAS_ACC_RAD_S2) && (fabsf(s->cmd_current_a) <= 0.03f)) {
+        tau_bias += BIAS_ALPHA * (tau_raw - tau_bias);
+    }
+
+    *vfilt_out = vfilt;
+    *afilt_out = afilt;
+    *tau_bias_out = tau_bias;
+    return tau_raw - tau_bias;
 }
 
-static void print_help(void)
+static float compute_assist_cmd(ctrl_state_t *s, float human_tau, float vfilt, float afilt)
 {
-    ESP_LOGI(TAG, "Commands:");
-    ESP_LOGI(TAG, "  ping");
-    ESP_LOGI(TAG, "  status");
-    ESP_LOGI(TAG, "  id <1..127>");
-    ESP_LOGI(TAG, "  scan_ids");
-    ESP_LOGI(TAG, "  raw on|off");
-    ESP_LOGI(TAG, "  enable");
-    ESP_LOGI(TAG, "  disable");
-    ESP_LOGI(TAG, "  stop");
-    ESP_LOGI(TAG, "  spin_once cw");
-    ESP_LOGI(TAG, "  spin_once ccw");
-    ESP_LOGI(TAG, "Note: if extd=1 in status, spin_once uses Servo mode position command.");
+    float abs_v = fabsf(vfilt);
+    float abs_a = fabsf(afilt);
+    float abs_tau = fabsf(human_tau);
+
+    if (!s->intent_active) {
+        if ((abs_v >= INTENT_START_VEL_ERPM) || (abs_a >= INTENT_START_ACC_RAD_S2)) {
+            s->intent_active = true;
+        }
+    } else if ((abs_v <= INTENT_STOP_VEL_ERPM) && (abs_tau <= HUMAN_TAU_DEADBAND)) {
+        s->intent_active = false;
+    }
+
+    if (!s->intent_active || abs_tau <= HUMAN_TAU_DEADBAND) {
+        return 0.0f;
+    }
+
+    float tau_assist = ASSIST_GAIN * human_tau;
+    float raw_cmd = tau_assist / K_TAU_PER_AMP;
+    return clampf(raw_cmd, -MAX_ASSIST_CURRENT_A, MAX_ASSIST_CURRENT_A);
 }
 
-static void send_enter_for_id(int id)
+static float compute_transparent_cmd(const ctrl_state_t *s)
 {
-    twai_message_t msg = {
-        .identifier = (uint32_t)id,
-        .data_length_code = 8,
-        .flags = 0,
-    };
-    memcpy(msg.data, CMD_ENTER_MOTOR_MODE, 8);
-    (void)twai_transmit(&msg, pdMS_TO_TICKS(50));
+    float rel_deg = s->pos_deg - s->zero_ref_deg;
+    float rel_rad = rel_deg * DEG_TO_RAD;
+    float vel_rad_s = s->vel_filt_erpm * ERPM_TO_RAD_S;
+
+    float c_visc = TR_K_VEL * vel_rad_s;
+    float c_coul = TR_K_COULOMB * signf0(vel_rad_s);
+    float c_grav = TR_K_GRAV * sinf(rel_rad);
+    float tau_comp = c_visc + c_coul + c_grav;
+    float cmd = tau_comp / K_TAU_PER_AMP;
+    return clampf(cmd, -TR_MAX_CURRENT_A, TR_MAX_CURRENT_A);
 }
 
-static void print_status(void)
+static float apply_position_limit(float cmd_a, const ctrl_state_t *s)
+{
+    float rel_deg = s->pos_deg - s->zero_ref_deg;
+    if (rel_deg >= POS_LIMIT_DEG && cmd_a > 0.0f) return 0.0f;
+    if (rel_deg <= -POS_LIMIT_DEG && cmd_a < 0.0f) return 0.0f;
+    return cmd_a;
+}
+
+static void print_status_line(void)
+{
+    ctrl_state_t s;
+    portENTER_CRITICAL(&g_lock);
+    s = g;
+    portEXIT_CRITICAL(&g_lock);
+
+    const char *mode_str = (s.mode == MODE_ASSIST) ? "assist" : "transparent";
+    ESP_LOGI(TAG,
+             "STAT on=%d mode=%s intent=%d rel=%.1fdeg vel=%.0ferpm tau=%.3fNm cmd=%.2fA mot=%.2fA err=%d",
+             s.enabled, mode_str, s.intent_active, (s.pos_deg - s.zero_ref_deg), s.vel_filt_erpm,
+             s.human_tau_est_nm, s.cmd_current_a, s.cur_a, s.err_code);
+}
+
+static void print_bus_line(void)
 {
     twai_status_info_t tsi = {0};
     twai_get_status_info(&tsi);
 
-    motor_state_t s;
-    int motor_id;
+    ctrl_state_t s;
     portENTER_CRITICAL(&g_lock);
-    s = g_state;
-    motor_id = g_motor_id;
+    s = g;
     portEXIT_CRITICAL(&g_lock);
 
-    ESP_LOGI(TAG,
-             "STATUS id=%d enabled=%d tx=%lu rx=%lu rx_any=%lu seen=%d pos=%.3f vel=%.2f tq=%.2f temp=%d err=%d last_can=0x%03lX dlc=%u extd=%d",
-             motor_id, s.enabled, (unsigned long)s.tx_count, (unsigned long)s.rx_count,
-             (unsigned long)s.rx_any_count, s.fb_seen, s.p_fb, s.v_fb, s.t_fb, s.temp_fb, s.err_fb,
-             (unsigned long)s.last_rx_can_id, (unsigned)s.last_rx_dlc, (int)s.last_rx_extd);
-    ESP_LOGI(TAG,
-             "CAN state=%d txerr=%lu rxerr=%lu bus_err=%lu tx_failed=%lu arb_lost=%lu",
-             (int)tsi.state, (unsigned long)tsi.tx_error_counter, (unsigned long)tsi.rx_error_counter,
-             (unsigned long)tsi.bus_error_count, (unsigned long)tsi.tx_failed_count,
-             (unsigned long)tsi.arb_lost_count);
+    ESP_LOGI(TAG, "BUS tx=%lu rx=%lu rx_any=%lu can_state=%d txerr=%lu rxerr=%lu",
+             (unsigned long)s.tx_count, (unsigned long)s.rx_count, (unsigned long)s.rx_any_count,
+             (int)tsi.state, (unsigned long)tsi.tx_error_counter, (unsigned long)tsi.rx_error_counter);
 }
 
-static void can_receive_task(void *arg)
+static void can_rx_task(void *arg)
 {
     (void)arg;
-    twai_message_t rx_msg;
+    twai_message_t rx;
     while (1) {
-        if (twai_receive(&rx_msg, pdMS_TO_TICKS(100)) != ESP_OK) {
-            continue;
-        }
+        if (twai_receive(&rx, pdMS_TO_TICKS(100)) != ESP_OK) continue;
 
         portENTER_CRITICAL(&g_lock);
-        g_state.rx_any_count++;
-        g_state.last_rx_can_id = rx_msg.identifier;
-        g_state.last_rx_dlc = rx_msg.data_length_code;
-        g_state.last_rx_extd = ((rx_msg.flags & TWAI_MSG_FLAG_EXTD) != 0);
+        g.rx_any_count++;
         portEXIT_CRITICAL(&g_lock);
 
-        if (g_log_raw) {
-            ESP_LOGI(TAG, "RX_RAW can_id=0x%03lX extd=%d dlc=%d data=%02X %02X %02X %02X %02X %02X %02X %02X",
-                     (unsigned long)rx_msg.identifier, (int)((rx_msg.flags & TWAI_MSG_FLAG_EXTD) != 0), rx_msg.data_length_code,
-                     rx_msg.data[0], rx_msg.data[1], rx_msg.data[2], rx_msg.data[3],
-                     rx_msg.data[4], rx_msg.data[5], rx_msg.data[6], rx_msg.data[7]);
-        }
+        if (!(rx.flags & TWAI_MSG_FLAG_EXTD) || rx.data_length_code < 8) continue;
+        if ((int)(rx.identifier & 0xFF) != MOTOR_ID) continue;
 
-        if (rx_msg.flags & TWAI_MSG_FLAG_EXTD) {
-            // Servo-mode feedback frame format
-            // CAN ID low byte is controller ID, payload has pos/spd/cur/temp/err.
-            int32_t id8 = (int32_t)(rx_msg.identifier & 0xFF);
-            int16_t pos_i = (int16_t)((rx_msg.data[0] << 8) | rx_msg.data[1]);
-            int16_t spd_i = (int16_t)((rx_msg.data[2] << 8) | rx_msg.data[3]);
-            int16_t cur_i = (int16_t)((rx_msg.data[4] << 8) | rx_msg.data[5]);
-            float pos_deg = (float)pos_i * 0.1f;
-            float spd_erpm = (float)spd_i * 10.0f;
-            float cur_a = (float)cur_i * 0.01f;
-
-            portENTER_CRITICAL(&g_lock);
-            if (g_motor_id == MOTOR_ID) {
-                // Auto-adopt first seen servo ID when default id is still set.
-                g_motor_id = id8;
-            }
-            if (id8 == g_motor_id) {
-                g_state.fb_seen = true;
-                g_state.p_fb = pos_deg;
-                g_state.v_fb = spd_erpm;
-                g_state.t_fb = cur_a;
-                g_state.temp_fb = rx_msg.data[6];
-                g_state.err_fb = rx_msg.data[7];
-                g_state.rx_count++;
-            }
-            portEXIT_CRITICAL(&g_lock);
-            continue;
-        }
-
-        if (rx_msg.data_length_code < 6) {
-            continue;
-        }
-        int motor_id;
-        portENTER_CRITICAL(&g_lock);
-        motor_id = g_motor_id;
-        portEXIT_CRITICAL(&g_lock);
-
-        if ((int)rx_msg.identifier != motor_id && rx_msg.data[0] != motor_id) {
-            continue;
-        }
-
-        const int p_int = (rx_msg.data[1] << 8) | rx_msg.data[2];
-        const int v_int = (rx_msg.data[3] << 4) | (rx_msg.data[4] >> 4);
-        const int i_int = ((rx_msg.data[4] & 0x0F) << 8) | rx_msg.data[5];
-
-        const float p = uint_to_float(p_int, P_MIN, P_MAX, 16);
-        const float v = uint_to_float(v_int, V_MIN, V_MAX, 12);
-        const float t = uint_to_float(i_int, T_MIN, T_MAX, 12);
-        const int temp = (rx_msg.data_length_code > 6) ? ((int)rx_msg.data[6] - 40) : 0;
-        const int err = (rx_msg.data_length_code > 7) ? rx_msg.data[7] : 0;
+        int16_t p_i = (int16_t)((rx.data[0] << 8) | rx.data[1]);
+        int16_t v_i = (int16_t)((rx.data[2] << 8) | rx.data[3]);
+        int16_t c_i = (int16_t)((rx.data[4] << 8) | rx.data[5]);
 
         portENTER_CRITICAL(&g_lock);
-        g_state.fb_seen = true;
-        g_state.p_fb = p;
-        g_state.v_fb = v;
-        g_state.t_fb = t;
-        g_state.temp_fb = temp;
-        g_state.err_fb = err;
-        g_state.rx_count++;
+        g.fb_seen = true;
+        g.pos_deg = (float)p_i * 0.1f;
+        g.vel_erpm = (float)v_i * 10.0f;
+        g.cur_a = (float)c_i * 0.01f;
+        g.temp_c = rx.data[6];
+        g.err_code = rx.data[7];
+        g.rx_count++;
         portEXIT_CRITICAL(&g_lock);
     }
 }
@@ -276,40 +281,70 @@ static void can_receive_task(void *arg)
 static void control_task(void *arg)
 {
     (void)arg;
-    uint8_t tx[8];
+    TickType_t last_stat_tick = xTaskGetTickCount();
+    TickType_t last_bus_tick = xTaskGetTickCount();
+
     while (1) {
-        motor_state_t s;
+        ctrl_state_t s;
         portENTER_CRITICAL(&g_lock);
-        s = g_state;
+        s = g;
         portEXIT_CRITICAL(&g_lock);
 
-        if (s.enabled && !s.last_rx_extd) {
-            if (s.spin_active && s.fb_seen) {
-                const float pos_error = s.target_p - s.p_fb;
-                if (fabsf(pos_error) < 0.08f) {
-                    portENTER_CRITICAL(&g_lock);
-                    g_state.spin_active = false;
-                    g_state.p_cmd = s.target_p;
-                    g_state.v_cmd = 0.0f;
-                    g_state.kp_cmd = 20.0f;
-                    g_state.kd_cmd = 1.0f;
-                    g_state.t_cmd = 0.0f;
-                    portEXIT_CRITICAL(&g_lock);
-                    ESP_LOGI(TAG, "SPIN_DONE pos=%.3f", s.p_fb);
-                } else if ((esp_timer_get_time() - s.spin_start_us) > 8000000) {
-                    portENTER_CRITICAL(&g_lock);
-                    g_state.spin_active = false;
-                    portEXIT_CRITICAL(&g_lock);
-                    ESP_LOGW(TAG, "SPIN_TIMEOUT pos=%.3f target=%.3f", s.p_fb, s.target_p);
-                }
+        float cmd_target = 0.0f;
+        float vfilt = s.vel_filt_erpm;
+        float afilt = s.acc_filt_rad_s2;
+        float tau_bias = s.tau_bias_nm;
+        float human_tau = s.human_tau_est_nm;
+
+        if (s.fb_seen) {
+            if (!s.zero_ref_set) {
+                s.zero_ref_set = true;
+                s.zero_ref_deg = s.pos_deg;
+                ESP_LOGI(TAG, "EVT zero_ref_set=%.2fdeg", s.zero_ref_deg);
             }
 
-            pack_mit_command(s.p_cmd, s.v_cmd, s.kp_cmd, s.kd_cmd, s.t_cmd, tx);
-            if (send_can_frame(tx) == ESP_OK) {
-                portENTER_CRITICAL(&g_lock);
-                g_state.tx_count++;
-                portEXIT_CRITICAL(&g_lock);
+            human_tau = compute_human_tau(&s, &vfilt, &afilt, &tau_bias);
+            s.vel_filt_erpm = vfilt;
+            s.acc_filt_rad_s2 = afilt;
+            s.tau_bias_nm = tau_bias;
+            s.human_tau_est_nm = human_tau;
+
+            if (!s.enabled) {
+                s.intent_active = false;
+                cmd_target = 0.0f;
+            } else if (s.mode == MODE_ASSIST) {
+                cmd_target = compute_assist_cmd(&s, human_tau, vfilt, afilt);
+            } else {
+                s.intent_active = false;
+                cmd_target = compute_transparent_cmd(&s);
             }
+
+            cmd_target = apply_position_limit(cmd_target, &s);
+        }
+
+        float cmd_out = smooth_command_update(s.cmd_current_a, cmd_target);
+        if (send_servo_current(MOTOR_ID, cmd_out) == ESP_OK) {
+            portENTER_CRITICAL(&g_lock);
+            g.tx_count++;
+            g.vel_filt_erpm = s.vel_filt_erpm;
+            g.acc_filt_rad_s2 = s.acc_filt_rad_s2;
+            g.human_tau_est_nm = s.human_tau_est_nm;
+            g.tau_bias_nm = s.tau_bias_nm;
+            g.intent_active = s.intent_active;
+            g.zero_ref_deg = s.zero_ref_deg;
+            g.zero_ref_set = s.zero_ref_set;
+            g.cmd_current_a = cmd_out;
+            portEXIT_CRITICAL(&g_lock);
+        }
+
+        TickType_t now = xTaskGetTickCount();
+        if ((now - last_stat_tick) >= pdMS_TO_TICKS(STATUS_PERIOD_MS)) {
+            last_stat_tick = now;
+            print_status_line();
+        }
+        if ((now - last_bus_tick) >= pdMS_TO_TICKS(BUS_STATUS_PERIOD_MS)) {
+            last_bus_tick = now;
+            print_bus_line();
         }
 
         vTaskDelay(pdMS_TO_TICKS(CONTROL_PERIOD_MS));
@@ -320,165 +355,75 @@ static void handle_command(char *line)
 {
     if (line[0] == '\0') return;
 
+    if (strcmp(line, "help") == 0) {
+        ESP_LOGI(TAG, "EVT commands=on|off|mode assist|mode transparent|zero|status|ping");
+        return;
+    }
     if (strcmp(line, "ping") == 0) {
-        ESP_LOGI(TAG, "PONG");
+        ESP_LOGI(TAG, "EVT pong");
+        return;
+    }
+    if (strcmp(line, "on") == 0) {
+        portENTER_CRITICAL(&g_lock);
+        g.enabled = true;
+        portEXIT_CRITICAL(&g_lock);
+        ESP_LOGI(TAG, "EVT on");
+        return;
+    }
+    if (strcmp(line, "off") == 0) {
+        portENTER_CRITICAL(&g_lock);
+        g.enabled = false;
+        g.intent_active = false;
+        portEXIT_CRITICAL(&g_lock);
+        ESP_LOGI(TAG, "EVT off");
+        return;
+    }
+    if (strcmp(line, "mode assist") == 0) {
+        portENTER_CRITICAL(&g_lock);
+        g.mode = MODE_ASSIST;
+        portEXIT_CRITICAL(&g_lock);
+        ESP_LOGI(TAG, "EVT mode=assist");
+        return;
+    }
+    if (strcmp(line, "mode transparent") == 0) {
+        portENTER_CRITICAL(&g_lock);
+        g.mode = MODE_TRANSPARENT;
+        g.intent_active = false;
+        portEXIT_CRITICAL(&g_lock);
+        ESP_LOGI(TAG, "EVT mode=transparent");
+        return;
+    }
+    if (strcmp(line, "zero") == 0) {
+        portENTER_CRITICAL(&g_lock);
+        g.zero_ref_deg = g.pos_deg;
+        g.zero_ref_set = true;
+        portEXIT_CRITICAL(&g_lock);
+        ESP_LOGI(TAG, "EVT zero=%.2fdeg", g.zero_ref_deg);
         return;
     }
     if (strcmp(line, "status") == 0) {
-        print_status();
-        return;
-    }
-    if (strcmp(line, "help") == 0) {
-        print_help();
-        return;
-    }
-    if (strcmp(line, "raw on") == 0) {
-        g_log_raw = true;
-        ESP_LOGI(TAG, "ACK raw on");
-        return;
-    }
-    if (strcmp(line, "raw off") == 0) {
-        g_log_raw = false;
-        ESP_LOGI(TAG, "ACK raw off");
-        return;
-    }
-    int new_id = 0;
-    if (sscanf(line, "id %d", &new_id) == 1) {
-        if (new_id < 1 || new_id > 127) {
-            ESP_LOGW(TAG, "NACK id must be 1..127");
-            return;
-        }
-        portENTER_CRITICAL(&g_lock);
-        g_motor_id = new_id;
-        g_state.fb_seen = false;
-        g_state.rx_count = 0;
-        g_state.spin_active = false;
-        portEXIT_CRITICAL(&g_lock);
-        ESP_LOGI(TAG, "ACK id=%d", new_id);
-        return;
-    }
-    if (strcmp(line, "scan_ids") == 0) {
-        ESP_LOGI(TAG, "SCAN start ids=1..127");
-        portENTER_CRITICAL(&g_lock);
-        g_state.rx_any_count = 0;
-        g_state.rx_count = 0;
-        g_state.fb_seen = false;
-        g_state.last_rx_can_id = 0;
-        g_state.last_rx_dlc = 0;
-        portEXIT_CRITICAL(&g_lock);
-
-        for (int id = 1; id <= 127; id++) {
-            send_enter_for_id(id);
-            vTaskDelay(pdMS_TO_TICKS(2));
-        }
-        vTaskDelay(pdMS_TO_TICKS(150));
-        print_status();
-        ESP_LOGI(TAG, "SCAN done");
-        return;
-    }
-    if (strcmp(line, "enable") == 0) {
-        send_can_frame(CMD_ENTER_MOTOR_MODE);
-        portENTER_CRITICAL(&g_lock);
-        g_state.enabled = true;
-        portEXIT_CRITICAL(&g_lock);
-        ESP_LOGI(TAG, "ACK enable");
-        return;
-    }
-    if (strcmp(line, "disable") == 0) {
-        portENTER_CRITICAL(&g_lock);
-        g_state.enabled = false;
-        g_state.spin_active = false;
-        portEXIT_CRITICAL(&g_lock);
-        send_can_frame(CMD_EXIT_MOTOR_MODE);
-        ESP_LOGI(TAG, "ACK disable");
-        return;
-    }
-    if (strcmp(line, "stop") == 0) {
-        portENTER_CRITICAL(&g_lock);
-        g_state.spin_active = false;
-        g_state.v_cmd = 0.0f;
-        g_state.kp_cmd = 0.0f;
-        g_state.kd_cmd = 1.0f;
-        g_state.t_cmd = 0.0f;
-        portEXIT_CRITICAL(&g_lock);
-        ESP_LOGI(TAG, "ACK stop");
-        return;
-    }
-    if (strcmp(line, "spin_once cw") == 0 || strcmp(line, "spin_once ccw") == 0) {
-        motor_state_t s;
-        portENTER_CRITICAL(&g_lock);
-        s = g_state;
-        portEXIT_CRITICAL(&g_lock);
-
-        if (!s.fb_seen) {
-            ESP_LOGW(TAG, "NACK spin_once reason=no_feedback");
-            return;
-        }
-
-        const float sign = (strcmp(line, "spin_once cw") == 0) ? 1.0f : -1.0f;
-        // If we are receiving extended frames, use Servo mode set-position command
-        // with degrees; otherwise use MIT mode position target (radians).
-        if (s.last_rx_extd) {
-            int motor_id;
-            portENTER_CRITICAL(&g_lock);
-            motor_id = g_motor_id;
-            portEXIT_CRITICAL(&g_lock);
-
-            float target_deg = s.p_fb + (sign * 360.0f);
-            int32_t pos_cmd = (int32_t)lroundf(target_deg * 1000000.0f);
-            uint8_t payload[4] = {
-                (uint8_t)((pos_cmd >> 24) & 0xFF),
-                (uint8_t)((pos_cmd >> 16) & 0xFF),
-                (uint8_t)((pos_cmd >> 8) & 0xFF),
-                (uint8_t)(pos_cmd & 0xFF),
-            };
-            uint32_t can_id = ((uint32_t)motor_id & 0xFFu) | (4u << 8);  // CAN_PACKET_SET_POS
-            esp_err_t err = send_can_frame_ext(can_id, payload, 4);
-            if (err == ESP_OK) {
-                ESP_LOGI(TAG, "ACK spin_once servo id=%d target_deg=%.2f can=0x%03lX",
-                         motor_id, target_deg, (unsigned long)can_id);
-            } else {
-                ESP_LOGW(TAG, "NACK spin_once servo tx_err=%s", esp_err_to_name(err));
-            }
-            return;
-        }
-
-        const float target = s.p_fb + (sign * SPIN_ONE_TURN_RAD);
-        portENTER_CRITICAL(&g_lock);
-        g_state.enabled = true;
-        g_state.spin_active = true;
-        g_state.target_p = target;
-        g_state.spin_start_us = esp_timer_get_time();
-        g_state.p_cmd = target;
-        g_state.v_cmd = 0.0f;
-        g_state.kp_cmd = 20.0f;
-        g_state.kd_cmd = 1.0f;
-        g_state.t_cmd = 0.0f;
-        portEXIT_CRITICAL(&g_lock);
-        send_can_frame(CMD_ENTER_MOTOR_MODE);
-        ESP_LOGI(TAG, "ACK spin_once target=%.3f", target);
+        print_status_line();
+        print_bus_line();
         return;
     }
 
-    ESP_LOGW(TAG, "NACK unknown_cmd=%s", line);
+    ESP_LOGW(TAG, "WARN unknown_cmd=%s", line);
 }
 
 static void serial_task(void *arg)
 {
     (void)arg;
-    char line[128];
+    char line[96];
     size_t idx = 0;
     memset(line, 0, sizeof(line));
 
-    print_help();
-    ESP_LOGI(TAG, "READY");
-
+    ESP_LOGI(TAG, "EVT ready");
     while (1) {
         uint8_t ch = 0;
         int n = usb_serial_jtag_read_bytes(&ch, 1, 20 / portTICK_PERIOD_MS);
         if (n <= 0) continue;
-
         if (ch == '\r') continue;
+
         if (ch == '\n') {
             line[idx] = '\0';
             handle_command(line);
@@ -490,14 +435,14 @@ static void serial_task(void *arg)
             line[idx++] = (char)ch;
         } else {
             idx = 0;
-            ESP_LOGW(TAG, "NACK line_too_long");
+            ESP_LOGW(TAG, "WARN cmd_too_long");
         }
     }
 }
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "=== Single Motor Spin Test ===");
+    ESP_LOGI(TAG, "EVT boot id=%d", MOTOR_ID);
 
     usb_serial_jtag_driver_config_t usb_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
     esp_err_t usb_err = usb_serial_jtag_driver_install(&usb_cfg);
@@ -512,9 +457,9 @@ void app_main(void)
 
     ESP_ERROR_CHECK(twai_driver_install(&g_config, &t_config, &f_config));
     ESP_ERROR_CHECK(twai_start());
-    ESP_LOGI(TAG, "TWAI started @ 1Mbps, MOTOR_ID=%d", MOTOR_ID);
+    ESP_LOGI(TAG, "EVT twai_started_1mbps");
 
-    xTaskCreatePinnedToCore(can_receive_task, "can_rx", 4096, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(can_rx_task, "can_rx", 4096, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(control_task, "ctrl", 4096, NULL, 4, NULL, 0);
     xTaskCreatePinnedToCore(serial_task, "serial", 4096, NULL, 3, NULL, 0);
 
