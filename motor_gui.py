@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import queue
+import re
 import threading
 import tkinter as tk
 from tkinter import ttk
@@ -8,28 +9,14 @@ from tkinter import ttk
 import serial
 
 
-IMPORTANT_KEYS = ("EVT", "STAT", "WARN", "ERR", "BUS")
-
-
 def serial_reader(ser, q):
     while True:
         try:
             raw = ser.readline()
-        except Exception as exc:
-            q.put(f"[serial error] {exc}")
+        except Exception:
             return
-        if not raw:
-            continue
-        line = raw.decode(errors="replace").strip()
-        q.put(line)
-
-
-def extract_important(line):
-    for key in IMPORTANT_KEYS:
-        idx = line.find(key)
-        if idx >= 0:
-            return line[idx:]
-    return None
+        if raw:
+            q.put(raw.decode(errors="replace").strip())
 
 
 class MotorGui:
@@ -37,119 +24,158 @@ class MotorGui:
         self.root = root
         self.ser = ser
         self.q = queue.Queue()
-
-        self.mode_var = tk.StringVar(value="assist")
-        self.on_var = tk.StringVar(value="OFF")
-        self.status_var = tk.StringVar(value="Connecting...")
+        self.state = {
+            1: {
+                "angle": tk.StringVar(value="-- deg"),
+                "machine": tk.StringVar(value="idle"),
+                "human": tk.StringVar(value="idle"),
+                "in_range": True,
+            },
+            2: {
+                "angle": tk.StringVar(value="-- deg"),
+                "machine": tk.StringVar(value="idle"),
+                "human": tk.StringVar(value="idle"),
+                "in_range": True,
+            },
+        }
 
         self._build_ui()
         threading.Thread(target=serial_reader, args=(self.ser, self.q), daemon=True).start()
         self.send("status")
-        self.poll_logs()
+        self.poll()
 
     def _build_ui(self):
-        self.root.title("v1 Motor Control")
-        self.root.geometry("700x480")
+        self.root.title("Dual Motor Assist Status")
+        self.root.geometry("980x360")
+        self.root.configure(bg="#0f172a")
 
-        top = ttk.Frame(self.root, padding=10)
-        top.pack(fill=tk.X)
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("TFrame", background="#0f172a")
+        style.configure("Card.TFrame", background="#1e293b")
+        style.configure("CardTitle.TLabel", background="#1e293b", foreground="#cbd5e1", font=("Helvetica", 12, "bold"))
+        style.configure("CardValue.TLabel", background="#1e293b", foreground="#f8fafc", font=("Helvetica", 20, "bold"))
+        style.configure("StatusBar.TLabel", background="#14532d", foreground="#ecfdf5", font=("Helvetica", 12, "bold"), padding=8)
 
-        ttk.Label(top, text="Power").grid(row=0, column=0, sticky=tk.W, padx=(0, 8))
-        ttk.Button(top, text="ON", command=self.on).grid(row=0, column=1, padx=4)
-        ttk.Button(top, text="OFF", command=self.off).grid(row=0, column=2, padx=4)
-        ttk.Label(top, textvariable=self.on_var).grid(row=0, column=3, sticky=tk.W, padx=(8, 24))
+        wrapper = ttk.Frame(self.root, padding=14)
+        wrapper.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(top, text="Mode").grid(row=0, column=4, sticky=tk.W, padx=(0, 8))
-        ttk.Radiobutton(
-            top,
-            text="Transparent",
-            value="transparent",
-            variable=self.mode_var,
-            command=self.set_mode,
-        ).grid(row=0, column=5, padx=4)
-        ttk.Radiobutton(
-            top,
-            text="Assist",
-            value="assist",
-            variable=self.mode_var,
-            command=self.set_mode,
-        ).grid(row=0, column=6, padx=4)
+        self.status_bar = ttk.Label(wrapper, text="SYSTEM STATUS: ALL IN RANGE", style="StatusBar.TLabel", anchor=tk.CENTER)
+        self.status_bar.pack(fill=tk.X, pady=(0, 12))
 
-        ttk.Button(top, text="ZERO", command=lambda: self.send("zero")).grid(row=0, column=7, padx=(16, 4))
-        ttk.Button(top, text="STATUS", command=lambda: self.send("status")).grid(row=0, column=8, padx=4)
+        ttk.Label(wrapper, text="Motor 1", style="CardTitle.TLabel").pack(anchor=tk.W, pady=(0, 6))
+        row1 = ttk.Frame(wrapper)
+        row1.pack(fill=tk.BOTH, expand=True, pady=(0, 12))
+        self._card(row1, "Angle", self.state[1]["angle"]).pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
+        self._card(row1, "Machine", self.state[1]["machine"]).pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8)
+        self._card(row1, "Human", self.state[1]["human"]).pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
 
-        mid = ttk.Frame(self.root, padding=(10, 0, 10, 8))
-        mid.pack(fill=tk.X)
-        ttk.Label(mid, textvariable=self.status_var).pack(anchor=tk.W)
+        ttk.Label(wrapper, text="Motor 2", style="CardTitle.TLabel").pack(anchor=tk.W, pady=(0, 6))
+        row2 = ttk.Frame(wrapper)
+        row2.pack(fill=tk.BOTH, expand=True)
+        self._card(row2, "Angle", self.state[2]["angle"]).pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
+        self._card(row2, "Machine", self.state[2]["machine"]).pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8)
+        self._card(row2, "Human", self.state[2]["human"]).pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
 
-        log_frame = ttk.Frame(self.root, padding=(10, 0, 10, 10))
-        log_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.log = tk.Text(log_frame, height=20, wrap=tk.WORD, state=tk.DISABLED)
-        self.log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sb = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log.yview)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.log.configure(yscrollcommand=sb.set)
-
-    def append_log(self, msg):
-        self.log.configure(state=tk.NORMAL)
-        self.log.insert(tk.END, msg + "\n")
-        self.log.see(tk.END)
-        self.log.configure(state=tk.DISABLED)
+    def _card(self, parent, title, value_var):
+        frame = ttk.Frame(parent, style="Card.TFrame", padding=14)
+        ttk.Label(frame, text=title, style="CardTitle.TLabel").pack(anchor=tk.W)
+        ttk.Label(frame, textvariable=value_var, style="CardValue.TLabel").pack(anchor=tk.W, pady=(14, 0))
+        return frame
 
     def send(self, cmd):
         try:
             self.ser.write((cmd + "\n").encode())
-        except Exception as exc:
-            self.append_log(f"[send error] {exc}")
+        except Exception:
+            pass
 
-    def on(self):
-        self.send("on")
+    def _parse_stat(self, line):
+        mid = re.search(r"id=([0-9]+)", line)
+        if not mid:
+            return
+        motor_id = int(mid.group(1))
+        if motor_id not in self.state:
+            return
 
-    def off(self):
-        self.send("off")
+        rel = re.search(r"rel=([-0-9.]+)deg", line)
+        machine_dir = re.search(r"machine_dir=([a-zA-Z]+)", line)
+        intent_dir = re.search(r"intent_dir=([-0-9]+)", line)
+        in_range = re.search(r"in_range=([0-9]+)", line)
 
-    def set_mode(self):
-        self.send(f"mode {self.mode_var.get()}")
+        if rel:
+            deg = float(rel.group(1))
+            angle_text = f"{deg:.1f} deg"
+            if in_range and in_range.group(1) == "0":
+                angle_text += " (OUT OF RANGE)"
+            self.state[motor_id]["angle"].set(angle_text)
+        if in_range:
+            self.state[motor_id]["in_range"] = (in_range.group(1) == "1")
+            self._update_status_bar()
 
-    def _update_from_line(self, line):
-        if line.startswith("EVT on"):
-            self.on_var.set("ON")
-        elif line.startswith("EVT off"):
-            self.on_var.set("OFF")
-        elif line.startswith("EVT mode=assist"):
-            self.mode_var.set("assist")
-        elif line.startswith("EVT mode=transparent"):
-            self.mode_var.set("transparent")
-        elif line.startswith("STAT "):
-            self.status_var.set(line)
+        if machine_dir:
+            d = machine_dir.group(1).lower()
+            if d == "forward":
+                self.state[motor_id]["machine"].set("forward")
+            elif d == "backward":
+                self.state[motor_id]["machine"].set("backward")
+            else:
+                self.state[motor_id]["machine"].set("idle")
 
-    def poll_logs(self):
+        if intent_dir:
+            v = int(intent_dir.group(1))
+            if v > 0:
+                self.state[motor_id]["human"].set("forward")
+            elif v < 0:
+                self.state[motor_id]["human"].set("backward")
+            else:
+                self.state[motor_id]["human"].set("idle")
+
+    def _update_status_bar(self):
+        m1_ok = self.state[1]["in_range"]
+        m2_ok = self.state[2]["in_range"]
+
+        if m1_ok and m2_ok:
+            text = "SYSTEM STATUS: ALL IN RANGE"
+            bg = "#14532d"
+            fg = "#ecfdf5"
+        elif (not m1_ok) and (not m2_ok):
+            text = "SYSTEM STATUS: BOTH MOTORS OUT OF RANGE"
+            bg = "#7f1d1d"
+            fg = "#fef2f2"
+        elif not m1_ok:
+            text = "SYSTEM STATUS: MOTOR 1 OUT OF RANGE"
+            bg = "#7f1d1d"
+            fg = "#fef2f2"
+        else:
+            text = "SYSTEM STATUS: MOTOR 2 OUT OF RANGE"
+            bg = "#7f1d1d"
+            fg = "#fef2f2"
+
+        self.status_bar.configure(text=text, background=bg, foreground=fg)
+
+    def poll(self):
         while not self.q.empty():
             line = self.q.get_nowait()
-            important = extract_important(line)
-            if important is None:
-                continue
-            self._update_from_line(important)
-            self.append_log(important)
-        self.root.after(50, self.poll_logs)
+            if "STAT " in line:
+                self._parse_stat(line)
+        self.root.after(50, self.poll)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Minimal exoskeleton motor GUI")
+    ap = argparse.ArgumentParser(description="Minimal motor status UI")
     ap.add_argument("--port", default="/dev/cu.usbmodem101")
     ap.add_argument("--baud", type=int, default=115200)
     args = ap.parse_args()
 
     ser = serial.Serial(args.port, args.baud, timeout=0.1)
-
     root = tk.Tk()
-    app = MotorGui(root, ser)
+    MotorGui(root, ser)
 
     def on_close():
-        app.send("off")
-        ser.close()
-        root.destroy()
+        try:
+            ser.close()
+        finally:
+            root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
