@@ -18,8 +18,9 @@
 #define CAN_RX_GPIO GPIO_NUM_5
 #define MOTOR_ID 1
 
-#define CONTROL_PERIOD_MS 20
+#define CONTROL_PERIOD_MS 5
 #define SPIN_ONE_TURN_RAD 6.2831853f
+#define FB_TIMEOUT_US 200000LL
 
 #define P_MIN (-12.5f)
 #define P_MAX (12.5f)
@@ -33,14 +34,17 @@
 #define KD_MAX (5.0f)
 
 static const char *TAG = "cubemars";
-static const uint8_t CMD_ENTER_MOTOR_MODE[8] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC };
-static const uint8_t CMD_EXIT_MOTOR_MODE[8] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD };
+static const uint8_t CMD_ENTER_MOTOR_MODE[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC};
+static const uint8_t CMD_EXIT_MOTOR_MODE[8] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD};
 
-typedef struct {
+typedef struct
+{
     bool enabled;
+    bool fault;
     bool spin_active;
     float target_p;
     int64_t spin_start_us;
+    int64_t last_fb_time_us;
 
     float p_cmd;
     float v_cmd;
@@ -65,12 +69,14 @@ typedef struct {
 
 static motor_state_t g_state = {
     .enabled = false,
+    .fault = false,
     .spin_active = false,
     .p_cmd = 0.0f,
     .v_cmd = 0.0f,
     .kp_cmd = 0.0f,
     .kd_cmd = 1.0f,
     .t_cmd = 0.0f,
+    .last_fb_time_us = 0,
 };
 static portMUX_TYPE g_lock = portMUX_INITIALIZER_UNLOCKED;
 static int g_motor_id = MOTOR_ID;
@@ -83,8 +89,10 @@ static float uint_to_float(int x_int, float x_min, float x_max, int bits)
 
 static int float_to_uint(float x, float x_min, float x_max, int bits)
 {
-    if (x < x_min) x = x_min;
-    if (x > x_max) x = x_max;
+    if (x < x_min)
+        x = x_min;
+    if (x > x_max)
+        x = x_max;
     return (int)((x - x_min) * ((float)((1 << bits) - 1)) / (x_max - x_min));
 }
 
@@ -112,7 +120,8 @@ static esp_err_t send_can_frame_ext(uint32_t can_id, const uint8_t *data, uint8_
         .flags = TWAI_MSG_FLAG_EXTD,
     };
     memset(msg.data, 0, sizeof(msg.data));
-    if (data != NULL && dlc > 0) {
+    if (data != NULL && dlc > 0)
+    {
         memcpy(msg.data, data, dlc);
     }
     return twai_transmit(&msg, pdMS_TO_TICKS(100));
@@ -150,6 +159,7 @@ static void print_help(void)
     ESP_LOGI(TAG, "  spin_once cw");
     ESP_LOGI(TAG, "  spin_once ccw");
     ESP_LOGI(TAG, "Note: if extd=1 in status, spin_once uses Servo mode position command.");
+    ESP_LOGI(TAG, "Note: FAULT (fb_timeout >200ms) disables motor. Send 'disable' to clear.");
 }
 
 static void send_enter_for_id(int id)
@@ -176,8 +186,8 @@ static void print_status(void)
     portEXIT_CRITICAL(&g_lock);
 
     ESP_LOGI(TAG,
-             "STATUS id=%d enabled=%d tx=%lu rx=%lu rx_any=%lu seen=%d pos=%.3f vel=%.2f tq=%.2f temp=%d err=%d last_can=0x%03lX dlc=%u extd=%d",
-             motor_id, s.enabled, (unsigned long)s.tx_count, (unsigned long)s.rx_count,
+             "STATUS id=%d enabled=%d fault=%d tx=%lu rx=%lu rx_any=%lu seen=%d pos=%.3f vel=%.2f tq=%.2f temp=%d err=%d last_can=0x%03lX dlc=%u extd=%d",
+             motor_id, s.enabled, s.fault, (unsigned long)s.tx_count, (unsigned long)s.rx_count,
              (unsigned long)s.rx_any_count, s.fb_seen, s.p_fb, s.v_fb, s.t_fb, s.temp_fb, s.err_fb,
              (unsigned long)s.last_rx_can_id, (unsigned)s.last_rx_dlc, (int)s.last_rx_extd);
     ESP_LOGI(TAG,
@@ -191,8 +201,10 @@ static void can_receive_task(void *arg)
 {
     (void)arg;
     twai_message_t rx_msg;
-    while (1) {
-        if (twai_receive(&rx_msg, pdMS_TO_TICKS(100)) != ESP_OK) {
+    while (1)
+    {
+        if (twai_receive(&rx_msg, pdMS_TO_TICKS(100)) != ESP_OK)
+        {
             continue;
         }
 
@@ -203,14 +215,16 @@ static void can_receive_task(void *arg)
         g_state.last_rx_extd = ((rx_msg.flags & TWAI_MSG_FLAG_EXTD) != 0);
         portEXIT_CRITICAL(&g_lock);
 
-        if (g_log_raw) {
+        if (g_log_raw)
+        {
             ESP_LOGI(TAG, "RX_RAW can_id=0x%03lX extd=%d dlc=%d data=%02X %02X %02X %02X %02X %02X %02X %02X",
                      (unsigned long)rx_msg.identifier, (int)((rx_msg.flags & TWAI_MSG_FLAG_EXTD) != 0), rx_msg.data_length_code,
                      rx_msg.data[0], rx_msg.data[1], rx_msg.data[2], rx_msg.data[3],
                      rx_msg.data[4], rx_msg.data[5], rx_msg.data[6], rx_msg.data[7]);
         }
 
-        if (rx_msg.flags & TWAI_MSG_FLAG_EXTD) {
+        if (rx_msg.flags & TWAI_MSG_FLAG_EXTD)
+        {
             // Servo-mode feedback frame format
             // CAN ID low byte is controller ID, payload has pos/spd/cur/temp/err.
             int32_t id8 = (int32_t)(rx_msg.identifier & 0xFF);
@@ -222,11 +236,13 @@ static void can_receive_task(void *arg)
             float cur_a = (float)cur_i * 0.01f;
 
             portENTER_CRITICAL(&g_lock);
-            if (g_motor_id == MOTOR_ID) {
+            if (g_motor_id == MOTOR_ID)
+            {
                 // Auto-adopt first seen servo ID when default id is still set.
                 g_motor_id = id8;
             }
-            if (id8 == g_motor_id) {
+            if (id8 == g_motor_id)
+            {
                 g_state.fb_seen = true;
                 g_state.p_fb = pos_deg;
                 g_state.v_fb = spd_erpm;
@@ -234,12 +250,14 @@ static void can_receive_task(void *arg)
                 g_state.temp_fb = rx_msg.data[6];
                 g_state.err_fb = rx_msg.data[7];
                 g_state.rx_count++;
+                g_state.last_fb_time_us = esp_timer_get_time();
             }
             portEXIT_CRITICAL(&g_lock);
             continue;
         }
 
-        if (rx_msg.data_length_code < 6) {
+        if (rx_msg.data_length_code < 6)
+        {
             continue;
         }
         int motor_id;
@@ -247,7 +265,8 @@ static void can_receive_task(void *arg)
         motor_id = g_motor_id;
         portEXIT_CRITICAL(&g_lock);
 
-        if ((int)rx_msg.identifier != motor_id && rx_msg.data[0] != motor_id) {
+        if ((int)rx_msg.identifier != motor_id && rx_msg.data[0] != motor_id)
+        {
             continue;
         }
 
@@ -269,6 +288,7 @@ static void can_receive_task(void *arg)
         g_state.temp_fb = temp;
         g_state.err_fb = err;
         g_state.rx_count++;
+        g_state.last_fb_time_us = esp_timer_get_time();
         portEXIT_CRITICAL(&g_lock);
     }
 }
@@ -277,16 +297,35 @@ static void control_task(void *arg)
 {
     (void)arg;
     uint8_t tx[8];
-    while (1) {
+    while (1)
+    {
         motor_state_t s;
         portENTER_CRITICAL(&g_lock);
         s = g_state;
         portEXIT_CRITICAL(&g_lock);
 
-        if (s.enabled && !s.last_rx_extd) {
-            if (s.spin_active && s.fb_seen) {
+        if (s.enabled && !s.fault && s.fb_seen)
+        {
+            if ((esp_timer_get_time() - s.last_fb_time_us) > FB_TIMEOUT_US)
+            {
+                portENTER_CRITICAL(&g_lock);
+                g_state.fault = true;
+                g_state.enabled = false;
+                g_state.spin_active = false;
+                portEXIT_CRITICAL(&g_lock);
+                send_can_frame(CMD_EXIT_MOTOR_MODE);
+                ESP_LOGW(TAG, "FAULT reason=fb_timeout last_pos=%.3f", s.p_fb);
+                s.enabled = false;
+            }
+        }
+
+        if (s.enabled && !s.last_rx_extd)
+        {
+            if (s.spin_active && s.fb_seen)
+            {
                 const float pos_error = s.target_p - s.p_fb;
-                if (fabsf(pos_error) < 0.08f) {
+                if (fabsf(pos_error) < 0.08f)
+                {
                     portENTER_CRITICAL(&g_lock);
                     g_state.spin_active = false;
                     g_state.p_cmd = s.target_p;
@@ -296,16 +335,22 @@ static void control_task(void *arg)
                     g_state.t_cmd = 0.0f;
                     portEXIT_CRITICAL(&g_lock);
                     ESP_LOGI(TAG, "SPIN_DONE pos=%.3f", s.p_fb);
-                } else if ((esp_timer_get_time() - s.spin_start_us) > 8000000) {
+                }
+                else if ((esp_timer_get_time() - s.spin_start_us) > 8000000)
+                {
                     portENTER_CRITICAL(&g_lock);
                     g_state.spin_active = false;
+                    g_state.enabled = false;
                     portEXIT_CRITICAL(&g_lock);
+                    send_can_frame(CMD_EXIT_MOTOR_MODE);
                     ESP_LOGW(TAG, "SPIN_TIMEOUT pos=%.3f target=%.3f", s.p_fb, s.target_p);
+                    s.enabled = false;
                 }
             }
 
             pack_mit_command(s.p_cmd, s.v_cmd, s.kp_cmd, s.kd_cmd, s.t_cmd, tx);
-            if (send_can_frame(tx) == ESP_OK) {
+            if (send_can_frame(tx) == ESP_OK)
+            {
                 portENTER_CRITICAL(&g_lock);
                 g_state.tx_count++;
                 portEXIT_CRITICAL(&g_lock);
@@ -318,33 +363,41 @@ static void control_task(void *arg)
 
 static void handle_command(char *line)
 {
-    if (line[0] == '\0') return;
+    if (line[0] == '\0')
+        return;
 
-    if (strcmp(line, "ping") == 0) {
+    if (strcmp(line, "ping") == 0)
+    {
         ESP_LOGI(TAG, "PONG");
         return;
     }
-    if (strcmp(line, "status") == 0) {
+    if (strcmp(line, "status") == 0)
+    {
         print_status();
         return;
     }
-    if (strcmp(line, "help") == 0) {
+    if (strcmp(line, "help") == 0)
+    {
         print_help();
         return;
     }
-    if (strcmp(line, "raw on") == 0) {
+    if (strcmp(line, "raw on") == 0)
+    {
         g_log_raw = true;
         ESP_LOGI(TAG, "ACK raw on");
         return;
     }
-    if (strcmp(line, "raw off") == 0) {
+    if (strcmp(line, "raw off") == 0)
+    {
         g_log_raw = false;
         ESP_LOGI(TAG, "ACK raw off");
         return;
     }
     int new_id = 0;
-    if (sscanf(line, "id %d", &new_id) == 1) {
-        if (new_id < 1 || new_id > 127) {
+    if (sscanf(line, "id %d", &new_id) == 1)
+    {
+        if (new_id < 1 || new_id > 127)
+        {
             ESP_LOGW(TAG, "NACK id must be 1..127");
             return;
         }
@@ -357,7 +410,8 @@ static void handle_command(char *line)
         ESP_LOGI(TAG, "ACK id=%d", new_id);
         return;
     }
-    if (strcmp(line, "scan_ids") == 0) {
+    if (strcmp(line, "scan_ids") == 0)
+    {
         ESP_LOGI(TAG, "SCAN start ids=1..127");
         portENTER_CRITICAL(&g_lock);
         g_state.rx_any_count = 0;
@@ -367,7 +421,8 @@ static void handle_command(char *line)
         g_state.last_rx_dlc = 0;
         portEXIT_CRITICAL(&g_lock);
 
-        for (int id = 1; id <= 127; id++) {
+        for (int id = 1; id <= 127; id++)
+        {
             send_enter_for_id(id);
             vTaskDelay(pdMS_TO_TICKS(2));
         }
@@ -376,41 +431,59 @@ static void handle_command(char *line)
         ESP_LOGI(TAG, "SCAN done");
         return;
     }
-    if (strcmp(line, "enable") == 0) {
+    if (strcmp(line, "enable") == 0)
+    {
+        motor_state_t s_en;
+        portENTER_CRITICAL(&g_lock);
+        s_en = g_state;
+        portEXIT_CRITICAL(&g_lock);
+        if (s_en.fault)
+        {
+            ESP_LOGW(TAG, "NACK enable reason=fault_active send_disable_first");
+            return;
+        }
         send_can_frame(CMD_ENTER_MOTOR_MODE);
         portENTER_CRITICAL(&g_lock);
         g_state.enabled = true;
+        g_state.fb_seen = false;
         portEXIT_CRITICAL(&g_lock);
         ESP_LOGI(TAG, "ACK enable");
         return;
     }
-    if (strcmp(line, "disable") == 0) {
+    if (strcmp(line, "disable") == 0)
+    {
         portENTER_CRITICAL(&g_lock);
         g_state.enabled = false;
+        g_state.fault = false;
         g_state.spin_active = false;
         portEXIT_CRITICAL(&g_lock);
         send_can_frame(CMD_EXIT_MOTOR_MODE);
         ESP_LOGI(TAG, "ACK disable");
         return;
     }
-    if (strcmp(line, "stop") == 0) {
+    if (strcmp(line, "stop") == 0)
+    {
         portENTER_CRITICAL(&g_lock);
         g_state.spin_active = false;
+        g_state.enabled = false;
         g_state.v_cmd = 0.0f;
         g_state.kp_cmd = 0.0f;
-        g_state.kd_cmd = 1.0f;
+        g_state.kd_cmd = 0.0f;
         g_state.t_cmd = 0.0f;
         portEXIT_CRITICAL(&g_lock);
+        send_can_frame(CMD_EXIT_MOTOR_MODE);
         ESP_LOGI(TAG, "ACK stop");
         return;
     }
-    if (strcmp(line, "spin_once cw") == 0 || strcmp(line, "spin_once ccw") == 0) {
+    if (strcmp(line, "spin_once cw") == 0 || strcmp(line, "spin_once ccw") == 0)
+    {
         motor_state_t s;
         portENTER_CRITICAL(&g_lock);
         s = g_state;
         portEXIT_CRITICAL(&g_lock);
 
-        if (!s.fb_seen) {
+        if (!s.fb_seen)
+        {
             ESP_LOGW(TAG, "NACK spin_once reason=no_feedback");
             return;
         }
@@ -418,7 +491,8 @@ static void handle_command(char *line)
         const float sign = (strcmp(line, "spin_once cw") == 0) ? 1.0f : -1.0f;
         // If we are receiving extended frames, use Servo mode set-position command
         // with degrees; otherwise use MIT mode position target (radians).
-        if (s.last_rx_extd) {
+        if (s.last_rx_extd)
+        {
             int motor_id;
             portENTER_CRITICAL(&g_lock);
             motor_id = g_motor_id;
@@ -432,12 +506,15 @@ static void handle_command(char *line)
                 (uint8_t)((pos_cmd >> 8) & 0xFF),
                 (uint8_t)(pos_cmd & 0xFF),
             };
-            uint32_t can_id = ((uint32_t)motor_id & 0xFFu) | (4u << 8);  // CAN_PACKET_SET_POS
+            uint32_t can_id = ((uint32_t)motor_id & 0xFFu) | (4u << 8); // CAN_PACKET_SET_POS
             esp_err_t err = send_can_frame_ext(can_id, payload, 4);
-            if (err == ESP_OK) {
+            if (err == ESP_OK)
+            {
                 ESP_LOGI(TAG, "ACK spin_once servo id=%d target_deg=%.2f can=0x%03lX",
                          motor_id, target_deg, (unsigned long)can_id);
-            } else {
+            }
+            else
+            {
                 ESP_LOGW(TAG, "NACK spin_once servo tx_err=%s", esp_err_to_name(err));
             }
             return;
@@ -473,22 +550,29 @@ static void serial_task(void *arg)
     print_help();
     ESP_LOGI(TAG, "READY");
 
-    while (1) {
+    while (1)
+    {
         uint8_t ch = 0;
         int n = usb_serial_jtag_read_bytes(&ch, 1, 20 / portTICK_PERIOD_MS);
-        if (n <= 0) continue;
+        if (n <= 0)
+            continue;
 
-        if (ch == '\r') continue;
-        if (ch == '\n') {
+        if (ch == '\r')
+            continue;
+        if (ch == '\n')
+        {
             line[idx] = '\0';
             handle_command(line);
             idx = 0;
             continue;
         }
 
-        if (idx < (sizeof(line) - 1)) {
+        if (idx < (sizeof(line) - 1))
+        {
             line[idx++] = (char)ch;
-        } else {
+        }
+        else
+        {
             idx = 0;
             ESP_LOGW(TAG, "NACK line_too_long");
         }
@@ -501,7 +585,8 @@ void app_main(void)
 
     usb_serial_jtag_driver_config_t usb_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
     esp_err_t usb_err = usb_serial_jtag_driver_install(&usb_cfg);
-    if (usb_err != ESP_OK && usb_err != ESP_ERR_INVALID_STATE) {
+    if (usb_err != ESP_OK && usb_err != ESP_ERR_INVALID_STATE)
+    {
         ESP_ERROR_CHECK(usb_err);
     }
 
@@ -518,7 +603,8 @@ void app_main(void)
     xTaskCreatePinnedToCore(control_task, "ctrl", 4096, NULL, 4, NULL, 0);
     xTaskCreatePinnedToCore(serial_task, "serial", 4096, NULL, 3, NULL, 0);
 
-    while (1) {
+    while (1)
+    {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
